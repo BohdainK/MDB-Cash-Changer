@@ -2,7 +2,6 @@
 
 ## TODO
 ### Code
-- MUST: Ability to disable accepting coins without stopping with polling
 - MUST: 2 euro coins not accepted?
 - MUST: Logic for coin dispensing of desired amount
    - COULD: logic for entering desired amount and disabling any further coin input
