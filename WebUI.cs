@@ -72,8 +72,13 @@ button:hover { background:#005fa3; }
 <h2>MDB Cash Changer - Live View</h2>
 
 <div id='controls'>
-<button onclick='resetTubes()' style='background:#b22222'>Reset All Tubes</button>
+    <button onclick='resetTubes()' style='background:#b22222'>Reset All Tubes</button>
 </div>
+<label>
+    <input type='checkbox' id='acceptToggle' checked onchange='toggleCoinInput(this.checked)'>
+    Accept Coins
+</label>
+
 
 <table id='coinTable'>
 <thead><tr><th>Type</th><th>Value</th><th>Count</th><th>Capacity</th><th>Full%</th><th>Status</th><th>Action</th></tr></thead>
@@ -123,6 +128,11 @@ function resetTubes() {
         ws.send(JSON.stringify({ action:'reset' }));
     }
 }
+
+function toggleCoinInput(enabled) {
+    ws.send(JSON.stringify({ action:'toggle_accept', enabled }));
+}
+
 </script>
 </body>
 </html>";
@@ -184,6 +194,11 @@ function resetTubes() {
                         device.ResetAllTubes();
                         BroadcastAsync(JsonSerializer.Serialize(new { type = "reset" }));
                         break;
+                    case "toggle_accept":
+                        bool enabled = json.RootElement.GetProperty("enabled").GetBoolean();
+                        device.CoinInputEnabled = enabled;
+                        break;
+
                 }
             }
             catch (Exception ex)

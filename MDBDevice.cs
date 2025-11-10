@@ -24,6 +24,7 @@ namespace MDBControllerLib
 
         private string? lastEventPayload;
 
+        private bool coinInputEnabled = true;
 
 
         public MDBDevice(SerialManager serial, CancellationToken cancellationToken)
@@ -175,6 +176,41 @@ namespace MDBControllerLib
             return true;
         }
 
+        public bool CoinInputEnabled
+        {
+            get => coinInputEnabled;
+            set
+            {
+                if (coinInputEnabled == value) return;
+                coinInputEnabled = value;
+                ApplyCoinInhibitState();
+            }
+        }
+
+        private void ApplyCoinInhibitState()
+        {
+            try
+            {
+                if (coinInputEnabled)
+                {
+                    // Allow all coins again
+                    serial.WriteLine(CommandConstants.COIN_TYPE);
+                    Console.WriteLine("Coin input ENABLED");
+                }
+                else
+                {
+                    // Disable acceptance of coins
+                    serial.WriteLine(CommandConstants.INHIBIT_COIN_ACCEPTOR);
+                    Console.WriteLine("Coin input DISABLED");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to apply coin inhibit state: {ex.Message}");
+            }
+        }
+
+
         #region --- UI-Friendly Methods ---
 
 
@@ -202,7 +238,6 @@ namespace MDBControllerLib
         {
             try { OnStateChanged?.Invoke(message); } catch { }
         }
-
 
         // Reset all tubes to 0 coins.
         public void ResetAllTubes()
