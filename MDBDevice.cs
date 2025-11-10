@@ -1,3 +1,9 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using LiteDB;
 
 namespace MDBControllerLib
 {
@@ -5,68 +11,63 @@ namespace MDBControllerLib
     {
         private readonly SerialManager serial;
         private readonly CancellationToken cancellationToken;
-        private readonly Dictionary<int, int> coinTypeValues = new Dictionary<int, int>();
-        private readonly Dictionary<int, int> tubeCounts = new Dictionary<int, int>();
+        private readonly Dictionary<int, int> coinTypeValues = new(); // type → value
+
+        private const string DatabasePath = "coins.db";
+        private readonly LiteDatabase db;
+        private readonly ILiteCollection<CoinTube> tubes;
+
+        public IReadOnlyDictionary<int, int> CoinTypeValues => coinTypeValues;
+        public string? LastEvent => lastEventPayload;
+
+        private enum CoinEventType { None, Accepted, Dispensed }
 
         private string? lastEventPayload;
+
+
 
         public MDBDevice(SerialManager serial, CancellationToken cancellationToken)
         {
             this.serial = serial ?? throw new ArgumentNullException(nameof(serial));
             this.cancellationToken = cancellationToken;
+
+            db = new LiteDatabase(DatabasePath);
+            tubes = db.GetCollection<CoinTube>("coin_tubes");
+            tubes.EnsureIndex(x => x.CoinType);
         }
 
         public void InitCoinAcceptor()
         {
-            // Enable master
             serial.WriteLine(CommandConstants.ENABLE_MASTER);
             serial.ReadLine(200);
 
-            // Reset
             serial.WriteLine(CommandConstants.RESET_COIN_ACCEPTOR);
             ThreadShortDelay();
             serial.ReadLine(200);
 
-            // Request setup info
             serial.WriteLine(CommandConstants.REQUEST_SETUP_INFO);
             var setup = serial.ReadLine(500);
             if (!string.IsNullOrEmpty(setup))
-            {
-                Console.WriteLine($"Setup ({setup})");
                 TryBuildCoinMapFromSetup(setup);
-            }
 
-            // Expansion
-            serial.WriteLine(CommandConstants.EXPANSION_REQUEST);
-            var expansion = serial.ReadLine(500);
-            if (!string.IsNullOrEmpty(expansion))
+            // Initialize or ensure tube records exist in the DB
+            foreach (var type in coinTypeValues.Keys)
             {
-                Console.WriteLine($"Expansion ({expansion})");
-            }
-
-            serial.WriteLine(CommandConstants.EXPANSION_FEATURE_ENABLE);
-            serial.ReadLine(200);
-
-            serial.WriteLine(CommandConstants.TUBE_STATUS_REQUEST);
-            var tubeResp = serial.ReadLine(200);
-            if (!string.IsNullOrEmpty(tubeResp))
-            {
-                UpdateTubeCountsFromStatus(tubeResp);
+                if (!tubes.Exists(t => t.CoinType == type))
+                    tubes.Insert(new CoinTube { CoinType = type, Value = coinTypeValues[type], Count = 0, Capacity = 50 });
             }
 
             serial.WriteLine(CommandConstants.COIN_TYPE);
             serial.ReadLine(200);
         }
 
-        public Task StartPollingAsync()
-        {
-            return Task.Run(PollLoop);
-        }
+        public IEnumerable<CoinTube> CoinTubes => tubes.FindAll();
+
+        public Task StartPollingAsync() => Task.Run(PollLoop);
 
         private async Task PollLoop()
-        {
-            string? lastSeen = null;
 
+        {
             while (!cancellationToken.IsCancellationRequested)
             {
                 try
@@ -74,199 +75,199 @@ namespace MDBControllerLib
                     serial.WriteLine(CommandConstants.POLL);
                     var resp = serial.ReadLine(600);
 
+
                     if (string.IsNullOrEmpty(resp))
                     {
                         await Task.Delay(150, cancellationToken);
                         continue;
                     }
 
-                    var (isEvent, parsed) = IsCoinEvent(resp);
-                    if (isEvent)
+                    var (eventType, parsed, coinType) = ParseCoinEvent(resp);
+                    if (eventType != CoinEventType.None && coinType.HasValue)
                     {
                         lastEventPayload = parsed;
-                        if (resp != lastSeen)
-                            Console.WriteLine($"Coin update: {parsed}");
-                        lastSeen = resp;
+                        Console.WriteLine($"Coin event: {parsed}");
+
+                        var tube = tubes.FindOne(t => t.CoinType == coinType.Value);
+                        if (tube != null)
+                        {
+                            switch (eventType)
+                            {
+                                case CoinEventType.Accepted:
+                                    tube.Count = Math.Min(tube.Count + 1, tube.Capacity);
+                                    NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
+                                        new { eventType = "coin", coinType, newCount = tube.Count }));
+                                    break;
+
+                                case CoinEventType.Dispensed:
+                                    tube.Count = Math.Max(0, tube.Count - 1);
+                                    NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
+                                        new { eventType = "dispense", coinType, newCount = tube.Count }));
+                                    break;
+                            }
+
+                            tubes.Update(tube);
+                        }
                     }
-                    else
-                    {
-                        lastSeen = null;
-                    }
+
 
                     await Task.Delay(250, cancellationToken);
                 }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
+                catch (OperationCanceledException) { break; }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Poll loop error: {ex.Message}");
-                    try { await Task.Delay(500, cancellationToken); } catch { break; }
+                    await Task.Delay(500, cancellationToken);
                 }
             }
         }
 
         public void DispenseCoin(int coinType, int quantity = 1)
         {
-            if (coinType < 0 || coinType > 15 || quantity < 1 || quantity > 15)
-            {
-                Console.WriteLine("coin_type 0-15, quantity 1-15");
-                return;
-            }
-
             byte y1 = (byte)(((quantity & 0x0F) << 4) | (coinType & 0x0F));
             string cmd = $"{CommandConstants.DISPENSE},{y1:X2}";
             serial.WriteLine(cmd);
-
             var resp = serial.ReadLine(800);
-            Console.WriteLine($"Request (coin {coinType}, qty {quantity}), response: {resp}");
 
-            // Poging tot tube count
-            if (tubeCounts.ContainsKey(coinType))
+            Console.WriteLine($"Dispense (type {coinType}, qty {quantity}) → {resp}");
+
+            var tube = tubes.FindOne(t => t.CoinType == coinType);
+            if (tube != null)
             {
-                tubeCounts[coinType] = Math.Max(0, tubeCounts[coinType] - quantity);
+                tube.Count = Math.Max(0, tube.Count - quantity);
+                tubes.Update(tube);
+                NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(new { eventType = "dispense", coinType, quantity }));
             }
-            //
         }
-
-        // Expose coin values and last seen event for UI
-        public IReadOnlyDictionary<int, int> CoinTypeValues => coinTypeValues;
-        public string? LastEvent => lastEventPayload;
-        public IReadOnlyDictionary<int, int> TubeCounts => tubeCounts;
 
         public bool TryRefund(int amount, out Dictionary<int, int> selection)
         {
-            selection = [];
+            selection = new();
             if (amount <= 0) return false;
+            if (coinTypeValues.Count == 0) return false;
 
-            if (coinTypeValues == null || coinTypeValues.Count == 0)
-                return false;
-
-            // Build sorted list of coin types by value descending, prefer fuller tubes when values equal
-            var types = coinTypeValues
-                .Where(kv => kv.Value > 0)
-                .Select(kv => (coinType: kv.Key, value: kv.Value, maxCount: tubeCounts.ContainsKey(kv.Key) ? tubeCounts[kv.Key] : 1000))
-                .OrderByDescending(t => t.value)
-                .ThenByDescending(t => t.maxCount)
+            var allTubes = tubes.FindAll()
+                .OrderByDescending(t => t.Value)
+                .ThenByDescending(t => t.Fullness)
                 .ToList();
 
             int remaining = amount;
-
-            // First attempt: using available counts)
-            var greedySelection = new Dictionary<int, int>();
-            int remGreedy = remaining;
-            foreach (var t in types)
+            foreach (var t in allTubes)
             {
-                int maxAvail = Math.Min(t.maxCount, remGreedy / t.value);
-                if (maxAvail <= 0) continue;
-                greedySelection[t.coinType] = maxAvail;
-                remGreedy -= maxAvail * t.value;
-                if (remGreedy == 0) break;
-            }
-
-            if (remGreedy == 0)
-            {
-                selection = greedySelection;
-            }
-            else
-            {
-                // Try recursive search finding fuller tubes (types already sorted by value then fullness)
-                var temp = new Dictionary<int, int>();
-                bool found = TryFindCombination(types, 0, remaining, temp);
-                if (!found) return false;
-                selection = temp;
-            }
-
-            // Execute dispense 
-            foreach (var kv in selection)
-            {
-                int coinType = kv.Key;
-                int qty = kv.Value;
-                while (qty > 0)
+                int usable = Math.Min(t.Count, remaining / t.Value);
+                if (usable > 0)
                 {
-                    int batch = Math.Min(15, qty);
-                    DispenseCoin(coinType, batch);
-                    qty -= batch;
-                    try { System.Threading.Thread.Sleep(150); } catch { }
+                    selection[t.CoinType] = usable;
+                    remaining -= usable * t.Value;
                 }
+                if (remaining == 0) break;
             }
+
+            if (remaining != 0)
+            {
+                Console.WriteLine($"Refund failed: not enough coins to reach {amount}");
+                return false;
+            }
+
+            foreach (var kv in selection)
+                DispenseCoin(kv.Key, kv.Value);
 
             return true;
         }
 
-        // Find combination of coin types to sum to amount, respecting max counts
-        private bool TryFindCombination(List<(int coinType, int value, int maxCount)> types, int idx, int remaining, Dictionary<int, int> used)
+        #region --- UI-Friendly Methods ---
+
+
+        // Returns a DTO-friendly summary of all coin tubes for UI or logging.
+        public IEnumerable<CoinTubeSummary> GetTubeSummary()
         {
-            if (remaining == 0) return true;
-            if (idx >= types.Count) return false;
-
-            var t = types[idx];
-            int maxUse = Math.Min(t.maxCount, remaining / t.value);
-
-            for (int use = maxUse; use >= 0; use--)
-            {
-                if (use > 0) used[t.coinType] = use; else used.Remove(t.coinType);
-                int newRem = remaining - use * t.value;
-                if (TryFindCombination(types, idx + 1, newRem, used)) return true;
-            }
-
-            return false;
-        }
-
-        // Only partial tube status, only displays full or empty
-        private void UpdateTubeCountsFromStatus(string statusResp)
-        {
-            if (string.IsNullOrEmpty(statusResp) || !statusResp.StartsWith("p,")) return;
-            var payload = statusResp.Substring(2).Trim();
-            var bytes = ParseHexBytes(payload);
-            if (bytes.Count < 13) return;
-
-            // tube counts
-            for (int i = 7; i < Math.Min(bytes.Count, 13); i++)
-            {
-                int index = i - 7;
-                tubeCounts[index] = bytes[i];
-            }
-
-            if (bytes.Count > 13)
-            {
-                Console.WriteLine($"Tube full bits (byte 13) hit");
-                byte tubeFullFlags = bytes[13];
-                for (int i = 0; i < 6; i++)
+            return tubes.FindAll()
+                .OrderBy(t => t.CoinType)
+                .Select(t => new CoinTubeSummary
                 {
-                    bool isFull = (tubeFullFlags & (1 << i)) != 0;
-                    if (isFull)
-                    {
-                        tubeCounts[i] = 255; // mark full visually/logically
-                        Console.WriteLine($"Tube {i} marked as full (flag bit set)");
-                    }
-                }
-            }
-
-            Console.WriteLine($"Tube counts: {string.Join(", ", tubeCounts.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                    CoinType = t.CoinType,
+                    Value = t.Value,
+                    Count = t.Count,
+                    Capacity = t.Capacity,
+                    FullnessPercent = (int)(t.Fullness * 100),
+                    Status = t.Count == 0 ? "Empty" :
+                            t.Count == t.Capacity ? "Full" :
+                            "OK"
+                });
         }
 
+        public event Action<string>? OnStateChanged;
 
-        #region parsing helpers
-
-        private static List<byte> ParseHexBytes(string hexStr)
+        private void NotifyStateChanged(string message)
         {
-            var result = new List<byte>();
-            string hs = hexStr.Trim().Replace(",", "").Replace(" ", "");
-            if (string.IsNullOrEmpty(hs)) return result;
-            if (hs.Length % 2 != 0) hs = "0" + hs;
+            try { OnStateChanged?.Invoke(message); } catch { }
+        }
 
-            for (int i = 0; i < hs.Length; i += 2)
+
+        // Reset all tubes to 0 coins.
+        public void ResetAllTubes()
+        {
+            foreach (var tube in tubes.FindAll())
             {
-                if (byte.TryParse(hs.Substring(i, 2), System.Globalization.NumberStyles.HexNumber, null, out byte b))
-                    result.Add(b);
-                else
-                    break;
+                tube.Count = 0;
+                tubes.Update(tube);
+            }
+            Console.WriteLine("All tube counts reset to 0.");
+        }
+
+        // Manually set the coin count of a specific tube.
+        public void SetTubeCount(int coinType, int newCount)
+        {
+            var tube = tubes.FindOne(t => t.CoinType == coinType);
+            if (tube == null)
+            {
+                Console.WriteLine($"No tube found for coin type {coinType}");
+                return;
             }
 
-            return result;
+            tube.Count = Math.Max(0, Math.Min(newCount, tube.Capacity));
+            tubes.Update(tube);
+
+            Console.WriteLine($"Tube {coinType} updated to {tube.Count}/{tube.Capacity}");
         }
+
+        #endregion
+
+        #region --- Parsing helpers ---
+
+        private (CoinEventType type, string? message, int? coinType) ParseCoinEvent(string resp)
+        {
+            if (string.IsNullOrEmpty(resp) || !resp.StartsWith("p,"))
+                return (CoinEventType.None, null, null);
+
+            var payload = resp.Substring(2).Trim();
+            var bytes = ParseHexBytes(payload);
+            if (bytes.Count == 0)
+                return (CoinEventType.None, null, null);
+
+            byte b = bytes[0];
+            int coinType = b & 0x0F;
+            if (!coinTypeValues.ContainsKey(coinType))
+                return (CoinEventType.None, null, null);
+
+            // Distinguish by upper nibble
+            byte upper = (byte)(b & 0xF0);
+
+            CoinEventType evtType;
+            if (upper == 0x50) evtType = CoinEventType.Accepted;     // e.g., 0x51 = coin type 1 accepted
+            else if (upper == 0x90) evtType = CoinEventType.Dispensed; // e.g., 0x91 = coin type 1 dispensed
+            else evtType = CoinEventType.None;
+
+            string msg = evtType switch
+            {
+                CoinEventType.Accepted => $"Accepted coin {coinType} ({coinTypeValues[coinType]})",
+                CoinEventType.Dispensed => $"Dispensed coin {coinType}",
+                _ => null
+            };
+
+            return (evtType, msg, coinType);
+        }
+
 
         private void TryBuildCoinMapFromSetup(string setupResp)
         {
@@ -278,15 +279,18 @@ namespace MDBControllerLib
             try
             {
                 int scaling = bytes[3];
-                int maxTypes = Math.Min(16, bytes.Count - 7);
+
+                int startIndex = 8;
+                int maxTypes = Math.Min(16, bytes.Count - startIndex);
 
                 coinTypeValues.Clear();
                 for (int i = 0; i < maxTypes; i++)
                 {
-                    byte creditUnits = bytes[7 + i];
+                    byte creditUnits = bytes[startIndex + i];
                     if (creditUnits == 0) continue;
+
                     int value = creditUnits * scaling;
-                    coinTypeValues[i + 1] = value; // 1-based per MDB spec
+                    coinTypeValues[i + 1] = value; // keep 1-based numbering for display and protocol
                 }
 
                 Console.WriteLine($"Coin map (scaling={scaling}): {string.Join(", ", coinTypeValues.Select(kv => $"{kv.Key}={kv.Value}"))}");
@@ -298,62 +302,44 @@ namespace MDBControllerLib
         }
 
 
-        private (bool isCoin, string? message) IsCoinEvent(string resp)
+        private static List<byte> ParseHexBytes(string hexStr)
         {
-            if (string.IsNullOrEmpty(resp) || !resp.StartsWith("p,")) return (false, null);
-            var payload = resp.Substring(2).Trim();
-            if (payload.Equals("ACK", StringComparison.OrdinalIgnoreCase) || payload.Equals("NACK", StringComparison.OrdinalIgnoreCase))
-                return (false, null);
-
-            var bytes = ParseHexBytes(payload);
-            if (bytes.Count == 0) return (false, null);
-
-            byte b = bytes[0];
-            int statusNibble = (b >> 4) & 0x0F;
-            int coinType = b & 0x0F;
-
-            // Debug
-            Console.WriteLine($"Payload: {payload}");
-            Console.WriteLine($"Bytes: {string.Join(" ", bytes.Select(x => x.ToString("X2")))}");
-            Console.WriteLine($"Status nibble: {statusNibble}");
-            Console.WriteLine($"Coin-type nibble: {coinType}");
-
-            // status nibble
-            string statusMsg = statusNibble switch
-            {
-                0 => "unknown",
-                1 => "coin routed to cashbox",
-                2 => "coin rejected",
-                3 => "tube jam",
-                4 => "routed to cash box",
-                5 => "coin accepted",
-                6 => "mechanical reject",
-                7 => "tube full",
-                _ => $"unknown status {statusNibble}"
-            };
-
-            // Reject events
-            if (statusNibble == 7)
-                return (true, $"rejected coin (payload {payload})");
-
-            // Valid coin
-            if (coinTypeValues.ContainsKey(coinType))
-            {
-                int value = coinTypeValues[coinType];
-                string msg = $"accepted coin type {coinType} ({value} units) - {statusMsg}";
-                return (true, msg);
-            }
-
-            // Unknown type
-            return (true, $"unmapped coin event (status={statusMsg}, type={coinType}, payload={payload})");
+            var result = new List<byte>();
+            string hs = hexStr.Trim().Replace(",", "").Replace(" ", "");
+            if (hs.Length % 2 != 0) hs = "0" + hs;
+            for (int i = 0; i < hs.Length; i += 2)
+                if (byte.TryParse(hs.Substring(i, 2), System.Globalization.NumberStyles.HexNumber, null, out byte b))
+                    result.Add(b);
+            return result;
         }
 
+        private void ThreadShortDelay() => Thread.Sleep(50);
 
         #endregion
+    }
 
-        private void ThreadShortDelay()
+    internal class CoinTube
+    {
+        public int Id { get; set; }
+        public int CoinType { get; set; }
+        public int Value { get; set; }
+        public int Count { get; set; }
+        public int Capacity { get; set; }
+        public double Fullness => (double)Count / Capacity;
+    }
+
+    internal class CoinTubeSummary
+    {
+        public int CoinType { get; set; }
+        public int Value { get; set; }
+        public int Count { get; set; }
+        public int Capacity { get; set; }
+        public int FullnessPercent { get; set; }
+        public string Status { get; set; } = "OK";
+
+        public override string ToString()
         {
-            try { System.Threading.Thread.Sleep(50); } catch { }
+            return $"Type {CoinType}: {Value} units | {Count}/{Capacity} ({FullnessPercent}%) - {Status}";
         }
     }
 }

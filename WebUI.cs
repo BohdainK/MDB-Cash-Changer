@@ -1,194 +1,201 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
+using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
+using System.Linq;
 
 namespace MDBControllerLib
 {
-    // Very small embedded HTTP UI (no external deps). Serves a single page and two API endpoints.
-    internal class WebUI : IDisposable
+    internal class WebUI
     {
-        private readonly HttpListener listener;
         private readonly MDBDevice device;
-        private bool running = false;
+        private readonly HttpListener listener;
+        private readonly List<WebSocket> clients = new();
+        private readonly CancellationTokenSource cts = new();
 
-        public WebUI(MDBDevice device, string prefix = "http://localhost:8080/")
+        public WebUI(MDBDevice device, int port = 8080)
         {
-            this.device = device ?? throw new ArgumentNullException(nameof(device));
+            this.device = device;
             listener = new HttpListener();
-            listener.Prefixes.Add(prefix);
+            listener.Prefixes.Add($"http://localhost:{port}/");
+
+            // Subscribe to device updates
+            device.OnStateChanged += BroadcastAsync;
         }
 
-        public void Start()
+        public async Task StartAsync()
         {
-            running = true;
             listener.Start();
-            Task.Run(() => Loop());
-            Console.WriteLine("Web UI available at http://localhost:8080/");
-        }
-
-        private async Task Loop()
-        {
-            while (running)
+            Console.WriteLine("🌐 WebUI running on http://localhost:8080/");
+            while (!cts.Token.IsCancellationRequested)
             {
-                try
-                {
-                    var ctx = await listener.GetContextAsync();
-                    _ = Task.Run(() => Handle(ctx));
-                }
-                catch (HttpListenerException) { break; }
-                catch (Exception) { break; }
+                var ctx = await listener.GetContextAsync();
+
+                if (ctx.Request.IsWebSocketRequest)
+                    _ = HandleWebSocketAsync(ctx);
+                else
+                    await ServeHtmlAsync(ctx);
             }
         }
 
-        private void Handle(HttpListenerContext ctx)
+        public void Stop()
+        {
+            cts.Cancel();
+            listener.Stop();
+        }
+
+        private async Task ServeHtmlAsync(HttpListenerContext ctx)
+        {
+            const string html = @"
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='UTF-8'>
+<title>MDB Cash Changer - Live View</title>
+<style>
+body { font-family: Arial, sans-serif; background:#f8f8f8; margin:2em; }
+table { border-collapse: collapse; width: 100%; margin-top: 1em; background:white; }
+th, td { border: 1px solid #ccc; padding: 8px; text-align:center; }
+th { background-color:#eee; }
+button { padding:6px 10px; background:#0078d7; color:white; border:none; border-radius:5px; cursor:pointer; }
+button:hover { background:#005fa3; }
+.status-ok { color:green; font-weight:bold; }
+.status-full { color:orange; font-weight:bold; }
+.status-empty { color:red; font-weight:bold; }
+</style>
+</head>
+<body>
+<h2>MDB Cash Changer - Live View</h2>
+<table id='coinTable'>
+<thead><tr><th>Type</th><th>Value</th><th>Count</th><th>Capacity</th><th>Full%</th><th>Status</th><th>Action</th></tr></thead>
+<tbody></tbody>
+</table>
+
+<script>
+let ws = new WebSocket('ws://localhost:8080/ws');
+ws.onopen = () => { console.log('WebSocket connected'); ws.send('get_state'); };
+
+ws.onmessage = (msg) => {
+    const data = JSON.parse(msg.data);
+    if (data.type === 'state') renderTable(data.tubes);
+    else if (data.eventType) updateSingle(data);
+};
+
+function renderTable(tubes) {
+    const tbody = document.querySelector('#coinTable tbody');
+    tbody.innerHTML = '';
+    tubes.forEach(t => {
+        const tr = document.createElement('tr');
+        const cls = t.Status === 'Full' ? 'status-full' : t.Status === 'Empty' ? 'status-empty' : 'status-ok';
+        tr.innerHTML = `
+            <td>${t.CoinType}</td>
+            <td>${t.Value}</td>
+            <td id='count-${t.CoinType}'>${t.Count}</td>
+            <td>${t.Capacity}</td>
+            <td>${t.FullnessPercent}%</td>
+            <td class='${cls}'>${t.Status}</td>
+            <td><button onclick='dispense(${t.CoinType})'>Dispense</button></td>`;
+        tbody.appendChild(tr);
+    });
+}
+
+function updateSingle(e) {
+    const el = document.getElementById('count-' + e.coinType);
+    if (el) el.textContent = e.newCount ?? (parseInt(el.textContent) - (e.quantity || 0));
+}
+
+function dispense(type) {
+    ws.send(JSON.stringify({ action:'dispense', coinType:type }));
+}
+</script>
+</body>
+</html>";
+
+            byte[] buf = Encoding.UTF8.GetBytes(html);
+            ctx.Response.ContentType = "text/html";
+            ctx.Response.ContentLength64 = buf.Length;
+            await ctx.Response.OutputStream.WriteAsync(buf, 0, buf.Length);
+            ctx.Response.Close();
+        }
+
+        private async Task HandleWebSocketAsync(HttpListenerContext ctx)
+        {
+            var wsContext = await ctx.AcceptWebSocketAsync(subProtocol: null);
+            var ws = wsContext.WebSocket;
+            lock (clients) clients.Add(ws);
+
+            // Send initial tube state
+            await SendStateAsync(ws);
+
+            try
+            {
+                var buffer = new byte[1024];
+                while (ws.State == WebSocketState.Open)
+                {
+                    var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+                    if (result.MessageType == WebSocketMessageType.Close)
+                        break;
+
+                    var msg = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                    if (msg == "get_state")
+                        await SendStateAsync(ws);
+                    else
+                        await HandleClientMessageAsync(ws, msg);
+                }
+            }
+            finally
+            {
+                lock (clients) clients.Remove(ws);
+                await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None);
+            }
+        }
+
+        private async Task HandleClientMessageAsync(WebSocket ws, string msg)
         {
             try
             {
-                var req = ctx.Request;
-                var resp = ctx.Response;
-
-                if (req.HttpMethod == "GET" && req.Url.AbsolutePath == "/")
+                var json = JsonDocument.Parse(msg);
+                if (json.RootElement.TryGetProperty("action", out var act))
                 {
-                    var html = GetHTML();
-                    var data = Encoding.UTF8.GetBytes(html);
-                    resp.ContentType = "text/html; charset=utf-8";
-                    resp.OutputStream.Write(data, 0, data.Length);
-                    resp.Close();
-                    return;
-                }
-
-                if (req.HttpMethod == "GET" && (req.Url?.AbsolutePath ?? "/") == "/status")
-                {
-                    var status = new {
-                        coins = device.CoinTypeValues,
-                        tubes = device.TubeCounts,
-                        lastEvent = device.LastEvent
-                    };
-                    var json = JsonSerializer.Serialize(status);
-                    var data = Encoding.UTF8.GetBytes(json);
-                    resp.ContentType = "application/json";
-                    resp.OutputStream.Write(data, 0, data.Length);
-                    resp.Close();
-                    return;
-                }
-
-                if (req.HttpMethod == "POST" && (req.Url?.AbsolutePath ?? "/") == "/refund")
-                {
-                    using var sr = new System.IO.StreamReader(req.InputStream);
-                    var body = sr.ReadToEnd();
-                    try
+                    if (act.GetString() == "dispense")
                     {
-                        var doc = JsonDocument.Parse(body);
-                        if (doc.RootElement.TryGetProperty("amount", out var amt))
-                        {
-                            int amount = amt.GetInt32();
-                            if (device.TryRefund(amount, out var sel))
-                            {
-                                var json = JsonSerializer.Serialize(new { ok = true, selection = sel });
-                                var data = Encoding.UTF8.GetBytes(json);
-                                resp.ContentType = "application/json";
-                                resp.OutputStream.Write(data, 0, data.Length);
-                                resp.Close();
-                                return;
-                            }
-                            else
-                            {
-                                var json = JsonSerializer.Serialize(new { ok = false, error = "cannot make exact change or no coin map" });
-                                var data = Encoding.UTF8.GetBytes(json);
-                                resp.ContentType = "application/json";
-                                resp.OutputStream.Write(data, 0, data.Length);
-                                resp.StatusCode = 400;
-                                resp.Close();
-                                return;
-                            }
-                        }
+                        int coinType = json.RootElement.GetProperty("coinType").GetInt32();
+                        device.DispenseCoin(coinType, 1);
                     }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"WebUI message error: {ex.Message}");
+            }
+        }
+
+        private async Task SendStateAsync(WebSocket ws)
+        {
+            var tubes = device.GetTubeSummary();
+            var payload = JsonSerializer.Serialize(new { type = "state", tubes });
+            var bytes = Encoding.UTF8.GetBytes(payload);
+            await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+
+        private async void BroadcastAsync(string message)
+        {
+            var bytes = Encoding.UTF8.GetBytes(message);
+            List<WebSocket> targets;
+            lock (clients) targets = clients.ToList();
+
+            foreach (var ws in targets)
+            {
+                if (ws.State == WebSocketState.Open)
+                {
+                    try { await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None); }
                     catch { }
-
-                    resp.StatusCode = 400;
-                    resp.Close();
-                    return;
                 }
-
-                resp.StatusCode = 404;
-                resp.Close();
             }
-            catch { }
-        }
-
-        private string GetHTML()
-        {
-            return @"<!doctype html>
-<html>
-<head>
-  <meta charset='utf-8'/>
-  <title>MDB Changer UI</title>
-  <style>body{font-family:Arial,Helvetica,sans-serif;margin:20px}label{display:block;margin-top:8px}</style>
-</head>
-<body>
-  <h2>MDB Cash Changer</h2>
-  <div id='status'>Loading...</div>
-
-  <h3>Refund</h3>
-  <p>Enter amount in device units (see coin mapping above).</p>
-  <label>Amount <input id='amount' type='number' min='1'/></label>
-  <button id='refund'>Refund</button>
-  <div id='result'></div>
-
-  <script>
-        async function refresh(){
-            let r = await fetch('/status');
-            let j = await r.json();
-            let out = '<strong>Coin mappings:</strong><ul>';
-            for (const [k,v] of Object.entries(j.coins)){
-                out += `<li>type ${k} -> ${v} units</li>`;
-            }
-            out += '</ul>';
-
-            // Tubes (if reported)
-            if (j.tubes) {
-                out += '<strong>Tube counts:</strong><ul>';
-                let totalUnits = 0;
-                for (const [k,c] of Object.entries(j.tubes)){
-                    const coinVal = j.coins && j.coins[k] ? j.coins[k] : 0;
-                    out += `<li>type ${k} -> ${c} coins (value ${coinVal} each)</li>`;
-                    totalUnits += coinVal * (Number(c) || 0);
-                }
-                out += '</ul>';
-                out += `<div><strong>Total available units:</strong> ${totalUnits}</div>`;
-            }
-
-            out += '<strong>Last event:</strong> ' + (j.lastEvent ?? 'none');
-            document.getElementById('status').innerHTML = out;
-        }
-
-    document.getElementById('refund').addEventListener('click', async ()=>{
-      let amount = parseInt(document.getElementById('amount').value || '0');
-      document.getElementById('result').textContent = 'Processing...';
-      let r = await fetch('/refund',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({amount:amount})});
-      let j = await r.json();
-      if (r.ok){
-        document.getElementById('result').textContent = 'Refunded using: ' + JSON.stringify(j.selection);
-      } else {
-        document.getElementById('result').textContent = 'Error: ' + (j.error || 'unknown');
-      }
-      await refresh();
-    });
-
-    refresh();
-    setInterval(refresh,3000);
-  </script>
-</body>
-</html>";
-        }
-
-        public void Dispose()
-        {
-            running = false;
-            try { listener.Stop(); } catch { }
-            listener.Close();
         }
     }
 }

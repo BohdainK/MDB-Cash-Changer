@@ -36,9 +36,11 @@ namespace MDBController
                 // start poll loop
                 var poll = device.StartPollingAsync();
 
-                // start web UI
-                using var web = new WebUI(device);
-                web.Start();
+
+                var webui = new WebUI(device);
+                _ = webui.StartAsync(); // start web server asynchronously
+                Console.WriteLine("WebUI running on http://localhost:8080/");
+
 
                 // console
                 var input = new InputHandler(device);
