@@ -37,6 +37,7 @@ namespace MDBControllerLib
             tubes.EnsureIndex(x => x.CoinType);
         }
 
+        #region Initialization
         public void InitCoinAcceptor()
         {
             serial.WriteLine(CommandConstants.ENABLE_MASTER);
@@ -66,6 +67,9 @@ namespace MDBControllerLib
 
         public Task StartPollingAsync() => Task.Run(PollLoop);
 
+        #endregion
+
+        #region Polling loop
         private async Task PollLoop()
 
         {
@@ -122,7 +126,9 @@ namespace MDBControllerLib
                 }
             }
         }
+        #endregion
 
+        #region Coin dispensing
         public void DispenseCoin(int coinType, int quantity = 1)
         {
             byte y1 = (byte)(((quantity & 0x0F) << 4) | (coinType & 0x0F));
@@ -176,6 +182,11 @@ namespace MDBControllerLib
             return true;
         }
 
+        #endregion
+
+
+        #region Tube management
+
         public bool CoinInputEnabled
         {
             get => coinInputEnabled;
@@ -209,9 +220,6 @@ namespace MDBControllerLib
                 Console.WriteLine($"Failed to apply coin inhibit state: {ex.Message}");
             }
         }
-
-
-        #region --- UI-Friendly Methods ---
 
 
         // Returns a DTO-friendly summary of all coin tubes for UI or logging.
@@ -268,7 +276,7 @@ namespace MDBControllerLib
 
         #endregion
 
-        #region --- Parsing helpers ---
+        #region Parsing helpers
 
         private (CoinEventType type, string? message, int? coinType) ParseCoinEvent(string resp)
         {
@@ -353,6 +361,7 @@ namespace MDBControllerLib
         #endregion
     }
 
+    #region DTO classes
     internal class CoinTube
     {
         public int Id { get; set; }
@@ -377,4 +386,7 @@ namespace MDBControllerLib
             return $"Type {CoinType}: {Value} units | {Count}/{Capacity} ({FullnessPercent}%) - {Status}";
         }
     }
+
+    #endregion
 }
+
