@@ -1,12 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Linq;
 
 namespace MDBControllerLib
 {
@@ -23,7 +23,6 @@ namespace MDBControllerLib
             listener = new HttpListener();
             listener.Prefixes.Add($"http://localhost:{port}/");
 
-            // Subscribe to device updates
             device.OnStateChanged += BroadcastAsync;
         }
 
@@ -66,10 +65,16 @@ button:hover { background:#005fa3; }
 .status-ok { color:green; font-weight:bold; }
 .status-full { color:orange; font-weight:bold; }
 .status-empty { color:red; font-weight:bold; }
+#controls { margin-bottom: 1em; }
 </style>
 </head>
 <body>
 <h2>MDB Cash Changer - Live View</h2>
+
+<div id='controls'>
+<button onclick='resetTubes()' style='background:#b22222'>Reset All Tubes</button>
+</div>
+
 <table id='coinTable'>
 <thead><tr><th>Type</th><th>Value</th><th>Count</th><th>Capacity</th><th>Full%</th><th>Status</th><th>Action</th></tr></thead>
 <tbody></tbody>
@@ -83,6 +88,7 @@ ws.onmessage = (msg) => {
     const data = JSON.parse(msg.data);
     if (data.type === 'state') renderTable(data.tubes);
     else if (data.eventType) updateSingle(data);
+    else if (data.type === 'reset') ws.send('get_state');
 };
 
 function renderTable(tubes) {
@@ -111,6 +117,12 @@ function updateSingle(e) {
 function dispense(type) {
     ws.send(JSON.stringify({ action:'dispense', coinType:type }));
 }
+
+function resetTubes() {
+    if (confirm('Reset all tube counts to 0?')) {
+        ws.send(JSON.stringify({ action:'reset' }));
+    }
+}
 </script>
 </body>
 </html>";
@@ -128,7 +140,6 @@ function dispense(type) {
             var ws = wsContext.WebSocket;
             lock (clients) clients.Add(ws);
 
-            // Send initial tube state
             await SendStateAsync(ws);
 
             try
@@ -159,13 +170,20 @@ function dispense(type) {
             try
             {
                 var json = JsonDocument.Parse(msg);
-                if (json.RootElement.TryGetProperty("action", out var act))
+                if (!json.RootElement.TryGetProperty("action", out var act)) return;
+
+                string action = act.GetString() ?? "";
+                switch (action)
                 {
-                    if (act.GetString() == "dispense")
-                    {
+                    case "dispense":
                         int coinType = json.RootElement.GetProperty("coinType").GetInt32();
                         device.DispenseCoin(coinType, 1);
-                    }
+                        break;
+
+                    case "reset":
+                        device.ResetAllTubes();
+                        BroadcastAsync(JsonSerializer.Serialize(new { type = "reset" }));
+                        break;
                 }
             }
             catch (Exception ex)
