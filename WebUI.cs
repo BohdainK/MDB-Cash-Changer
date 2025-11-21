@@ -13,6 +13,7 @@ namespace MDBControllerLib
     internal class WebUI
     {
         private readonly MDBDevice device;
+    private readonly CoinRefundingManager refundManager;
         private readonly HttpListener listener;
         private readonly List<WebSocket> clients = new();
         private readonly CancellationTokenSource cts = new();
@@ -22,6 +23,10 @@ namespace MDBControllerLib
             this.device = device;
             listener = new HttpListener();
             listener.Prefixes.Add($"http://localhost:{port}/");
+
+            // Ensure refund manager is available to handle dispense_amount messages.
+            // Copy the device's coin type map so the manager has a stable view.
+            this.refundManager = new CoinRefundingManager(device, new System.Collections.Generic.Dictionary<int, int>(device.CoinTypeValues));
 
             device.OnStateChanged += BroadcastAsync;
         }
@@ -66,6 +71,7 @@ button:hover { background:#005fa3; }
 .status-full { color:orange; font-weight:bold; }
 .status-empty { color:red; font-weight:bold; }
 #controls { margin-bottom: 1em; }
+input[type='number'] { padding:6px; border:1px solid #ccc; border-radius:4px; }
 </style>
 </head>
 <body>
@@ -73,6 +79,12 @@ button:hover { background:#005fa3; }
 
 <div id='controls'>
     <button onclick='resetTubes()' style='background:#b22222'>Reset All Tubes</button>
+
+    <!-- New dispense amount controls -->
+    <span style='margin-left:1em;'>
+        <input type='number' id='amountInput' min='1' placeholder='Amount to dispense' />
+        <button onclick='dispenseAmount()' style='background:#228B22'>Dispense Amount</button>
+    </span>
 </div>
 <label>
     <input type='checkbox' id='acceptToggle' checked onchange='toggleCoinInput(this.checked)'>
@@ -81,7 +93,7 @@ button:hover { background:#005fa3; }
 
 
 <table id='coinTable'>
-<thead><tr><th>Type</th><th>Value</th><th>Count</th><th>Capacity</th><th>Full%</th><th>Status</th><th>Action</th></tr></thead>
+<thead><tr><th>Type</th><th>Value</th><th>Count</th><th>Dispensable</th><th>Capacity</th><th>Full%</th><th>Status</th><th>Action</th></tr></thead>
 <tbody></tbody>
 </table>
 
@@ -99,13 +111,14 @@ ws.onmessage = (msg) => {
 function renderTable(tubes) {
     const tbody = document.querySelector('#coinTable tbody');
     tbody.innerHTML = '';
-    tubes.forEach(t => {
+    tubes.forEach(t =>{
         const tr = document.createElement('tr');
         const cls = t.Status === 'Full' ? 'status-full' : t.Status === 'Empty' ? 'status-empty' : 'status-ok';
         tr.innerHTML = `
             <td>${t.CoinType}</td>
             <td>${t.Value}</td>
             <td id='count-${t.CoinType}'>${t.Count}</td>
+            <td id='dispensable-${t.CoinType}'>${t.Dispensable ?? 0}</td>
             <td>${t.Capacity}</td>
             <td>${t.FullnessPercent}%</td>
             <td class='${cls}'>${t.Status}</td>
@@ -115,12 +128,26 @@ function renderTable(tubes) {
 }
 
 function updateSingle(e) {
-    const el = document.getElementById('count-' + e.coinType);
-    if (el) el.textContent = e.newCount ?? (parseInt(el.textContent) - (e.quantity || 0));
+    const cEl = document.getElementById('count-' + e.coinType);
+    const dEl = document.getElementById('dispensable-' + e.coinType);
+    if (cEl && (e.newCount !== undefined)) cEl.textContent = e.newCount;
+    else if (cEl && (e.quantity !== undefined)) cEl.textContent = String(Math.max(0, parseInt(cEl.textContent || '0') - e.quantity));
+    if (dEl && (e.dispensable !== undefined)) dEl.textContent = e.dispensable;
 }
 
 function dispense(type) {
     ws.send(JSON.stringify({ action:'dispense', coinType:type }));
+}
+
+function dispenseAmount() {
+    const input = document.getElementById('amountInput');
+    const val = parseInt(input.value, 10);
+    if (!val || val <= 0) {
+        alert('Please enter a positive amount to dispense.');
+        return;
+    }
+    ws.send(JSON.stringify({ action:'dispense_amount', amount: val }));
+    input.value = '';
 }
 
 function resetTubes() {
@@ -189,7 +216,10 @@ function toggleCoinInput(enabled) {
                         int coinType = json.RootElement.GetProperty("coinType").GetInt32();
                         device.DispenseCoin(coinType, 1);
                         break;
-
+                    case "dispense_amount":
+                        int amount = json.RootElement.GetProperty("amount").GetInt32();
+                        refundManager.RefundAmount(amount);
+                        break;
                     case "reset":
                         device.ResetAllTubes();
                         BroadcastAsync(JsonSerializer.Serialize(new { type = "reset" }));
@@ -198,6 +228,7 @@ function toggleCoinInput(enabled) {
                         bool enabled = json.RootElement.GetProperty("enabled").GetBoolean();
                         device.CoinInputEnabled = enabled;
                         break;
+
 
                 }
             }

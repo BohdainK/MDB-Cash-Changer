@@ -11,9 +11,10 @@ namespace MDBControllerLib
     {
         private readonly SerialManager serial;
         private readonly CancellationToken cancellationToken;
-        private readonly Dictionary<int, int> coinTypeValues = new(); // type → value
+        private readonly Dictionary<int, int> coinTypeValues = new();
 
         private const string DatabasePath = "coins.db";
+        private const int SECURITY_STOCK = 3;
         private readonly LiteDatabase db;
         private readonly ILiteCollection<CoinTube> tubes;
 
@@ -35,6 +36,16 @@ namespace MDBControllerLib
             db = new LiteDatabase(DatabasePath);
             tubes = db.GetCollection<CoinTube>("coin_tubes");
             tubes.EnsureIndex(x => x.CoinType);
+
+            foreach (var tube in tubes.FindAll())
+            {
+                int expect = Math.Max(0, tube.Count - SECURITY_STOCK);
+                if (tube.Dispensable != expect)
+                {
+                    tube.Dispensable = expect;
+                    tubes.Update(tube);
+                }
+            }
         }
 
         #region Initialization
@@ -49,14 +60,51 @@ namespace MDBControllerLib
 
             serial.WriteLine(CommandConstants.REQUEST_SETUP_INFO);
             var setup = serial.ReadLine(500);
-            if (!string.IsNullOrEmpty(setup))
-                TryBuildCoinMapFromSetup(setup);
 
-            // Initialize or ensure tube records exist in the DB
-            foreach (var type in coinTypeValues.Keys)
+            if (!string.IsNullOrEmpty(setup))
             {
-                if (!tubes.Exists(t => t.CoinType == type))
-                    tubes.Insert(new CoinTube { CoinType = type, Value = coinTypeValues[type], Count = 0, Capacity = 50 });
+                TryBuildCoinMapFromSetup(setup);
+            }
+            else
+            {
+                Console.WriteLine("No setup response received; using fallback coin map.");
+                BuildFallbackCoinMap();
+            }
+
+            // Ensure tube definitions exist and denominations are correct
+            foreach (var kv in coinTypeValues)
+            {
+                int coinType = kv.Key;
+                int value = kv.Value;
+
+                var tube = tubes.FindOne(t => t.CoinType == coinType);
+                if (tube == null)
+                {
+                    tube = new CoinTube
+                    {
+                        CoinType = coinType,
+                        Value = value,
+                        Count = 0,
+                        Capacity = 50,
+                        Dispensable = 0
+                    };
+                    tubes.Insert(tube);
+                }
+                else
+                {
+                    tube.Value = value;
+                    tubes.Update(tube);
+                }
+            }
+
+            // If DB has no tubes or all counts are 0, get hardware tube status
+            var allTubes = tubes.FindAll().ToList();
+            bool dbLooksEmpty = allTubes.Count == 0 || allTubes.All(t => t.Count == 0);
+
+            if (dbLooksEmpty)
+            {
+                Console.WriteLine("Tube DB is empty or zeroed. Reading tube levels from hardware...");
+                RefreshTubeLevelsFromHardware();
             }
 
             serial.WriteLine(CommandConstants.COIN_TYPE);
@@ -100,14 +148,16 @@ namespace MDBControllerLib
                             {
                                 case CoinEventType.Accepted:
                                     tube.Count = Math.Min(tube.Count + 1, tube.Capacity);
+                                    tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
                                     NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
-                                        new { eventType = "coin", coinType, newCount = tube.Count }));
+                                        new { eventType = "coin", coinType, newCount = tube.Count, dispensable = tube.Dispensable }));
                                     break;
 
                                 case CoinEventType.Dispensed:
                                     tube.Count = Math.Max(0, tube.Count - 1);
+                                    tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
                                     NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
-                                        new { eventType = "dispense", coinType, newCount = tube.Count }));
+                                        new { eventType = "dispense", coinType, newCount = tube.Count, dispensable = tube.Dispensable }));
                                     break;
                             }
 
@@ -131,56 +181,44 @@ namespace MDBControllerLib
         #region Coin dispensing
         public void DispenseCoin(int coinType, int quantity = 1)
         {
-            byte y1 = (byte)(((quantity & 0x0F) << 4) | (coinType & 0x0F));
+            var tube = tubes.FindOne(t => t.CoinType == coinType);
+            if (tube == null)
+            {
+                Console.WriteLine($"No tube found for coin type {coinType}");
+                return;
+            }
+
+            if (quantity <= 0)
+            {
+                Console.WriteLine("Quantity must be >= 1");
+                return;
+            }
+
+            if (quantity > tube.Dispensable)
+            {
+                Console.WriteLine(
+                    $"Not enough dispensable coins for type {coinType}. " +
+                    $"Requested={quantity}, dispensable={tube.Dispensable}, count={tube.Count}");
+                return;
+            }
+
+            int rawType = coinType - 1;
+            if (rawType < 0 || rawType > 15)
+            {
+                Console.WriteLine($"Invalid coin type {coinType}");
+                return;
+            }
+
+            byte y1 = (byte)(((quantity & 0x0F) << 4) | (rawType & 0x0F));
             string cmd = $"{CommandConstants.DISPENSE},{y1:X2}";
             serial.WriteLine(cmd);
             var resp = serial.ReadLine(800);
 
-            Console.WriteLine($"Dispense (type {coinType}, qty {quantity}) → {resp}");
+            Console.WriteLine($"Dispense command (type {coinType}, raw={rawType}, qty {quantity}) ACK → {resp}");
 
-            var tube = tubes.FindOne(t => t.CoinType == coinType);
-            if (tube != null)
-            {
-                tube.Count = Math.Max(0, tube.Count - quantity);
-                tubes.Update(tube);
-                NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(new { eventType = "dispense", coinType, quantity }));
-            }
         }
 
-        public bool TryRefund(int amount, out Dictionary<int, int> selection)
-        {
-            selection = new();
-            if (amount <= 0) return false;
-            if (coinTypeValues.Count == 0) return false;
 
-            var allTubes = tubes.FindAll()
-                .OrderByDescending(t => t.Value)
-                .ThenByDescending(t => t.Fullness)
-                .ToList();
-
-            int remaining = amount;
-            foreach (var t in allTubes)
-            {
-                int usable = Math.Min(t.Count, remaining / t.Value);
-                if (usable > 0)
-                {
-                    selection[t.CoinType] = usable;
-                    remaining -= usable * t.Value;
-                }
-                if (remaining == 0) break;
-            }
-
-            if (remaining != 0)
-            {
-                Console.WriteLine($"Refund failed: not enough coins to reach {amount}");
-                return false;
-            }
-
-            foreach (var kv in selection)
-                DispenseCoin(kv.Key, kv.Value);
-
-            return true;
-        }
 
         #endregion
 
@@ -204,13 +242,11 @@ namespace MDBControllerLib
             {
                 if (coinInputEnabled)
                 {
-                    // Allow all coins again
                     serial.WriteLine(CommandConstants.COIN_TYPE);
                     Console.WriteLine("Coin input ENABLED");
                 }
                 else
                 {
-                    // Disable acceptance of coins
                     serial.WriteLine(CommandConstants.INHIBIT_COIN_ACCEPTOR);
                     Console.WriteLine("Coin input DISABLED");
                 }
@@ -232,6 +268,7 @@ namespace MDBControllerLib
                     CoinType = t.CoinType,
                     Value = t.Value,
                     Count = t.Count,
+                    Dispensable = t.Dispensable,
                     Capacity = t.Capacity,
                     FullnessPercent = (int)(t.Fullness * 100),
                     Status = t.Count == 0 ? "Empty" :
@@ -253,6 +290,7 @@ namespace MDBControllerLib
             foreach (var tube in tubes.FindAll())
             {
                 tube.Count = 0;
+                tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
                 tubes.Update(tube);
             }
             Console.WriteLine("All tube counts reset to 0.");
@@ -269,10 +307,75 @@ namespace MDBControllerLib
             }
 
             tube.Count = Math.Max(0, Math.Min(newCount, tube.Capacity));
+            tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
             tubes.Update(tube);
 
             Console.WriteLine($"Tube {coinType} updated to {tube.Count}/{tube.Capacity}");
         }
+
+        private void RefreshTubeLevelsFromHardware()
+        {
+            try
+            {
+                serial.WriteLine(CommandConstants.TUBE_STATUS_REQUEST);
+                var resp = serial.ReadLine(500);
+
+                if (string.IsNullOrWhiteSpace(resp) || !resp.StartsWith("p,"))
+                {
+                    Console.WriteLine("Tube status: no valid response.");
+                    return;
+                }
+
+                var payload = resp.Substring(2).Trim();
+                var bytes = ParseHexBytes(payload);
+
+                Console.WriteLine("TUBE STATUS RAW: " + resp);
+                Console.WriteLine("TUBE STATUS BYTES: " + string.Join(" ", bytes.Select(b => b.ToString("X2"))));
+
+                if (bytes.Count < 3)
+                {
+                    Console.WriteLine("Tube status: too few bytes.");
+                    return;
+                }
+
+                const int FLAGS_BYTES = 2;
+                const int MAX_TYPES = 16;
+
+                for (int rawType = 0; rawType < MAX_TYPES; rawType++)
+                {
+                    int idx = FLAGS_BYTES + rawType;
+                    if (idx >= bytes.Count)
+                        break;
+
+                    int approxCount = bytes[idx];
+                    int coinType = rawType + 1;
+
+                    var tube = tubes.FindOne(t => t.CoinType == coinType);
+                    if (tube == null)
+                    {
+                        int value = coinTypeValues.TryGetValue(coinType, out var v) ? v : 0;
+                        tube = new CoinTube
+                        {
+                            CoinType = coinType,
+                            Value = value,
+                            Capacity = 50
+                        };
+                    }
+
+                    tube.Count = approxCount;
+                    tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
+                    tubes.Upsert(tube);
+                }
+
+                Console.WriteLine("Tube levels refreshed from hardware.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error refreshing tube levels from hardware: {ex.Message}");
+            }
+        }
+
+
 
         #endregion
 
@@ -289,19 +392,18 @@ namespace MDBControllerLib
                 return (CoinEventType.None, null, null);
 
             byte b = bytes[0];
-            int coinType = b & 0x0F;
+            int rawType = b & 0x0F;
+            int coinType = rawType + 1;
             if (!coinTypeValues.ContainsKey(coinType))
                 return (CoinEventType.None, null, null);
 
-            // Distinguish by upper nibble
             byte upper = (byte)(b & 0xF0);
+            CoinEventType evtType =
+                upper == 0x50 ? CoinEventType.Accepted :
+                upper == 0x90 ? CoinEventType.Dispensed :
+                CoinEventType.None;
 
-            CoinEventType evtType;
-            if (upper == 0x50) evtType = CoinEventType.Accepted;     // e.g., 0x51 = coin type 1 accepted
-            else if (upper == 0x90) evtType = CoinEventType.Dispensed; // e.g., 0x91 = coin type 1 dispensed
-            else evtType = CoinEventType.None;
-
-            string msg = evtType switch
+            string? msg = evtType switch
             {
                 CoinEventType.Accepted => $"Accepted coin {coinType} ({coinTypeValues[coinType]})",
                 CoinEventType.Dispensed => $"Dispensed coin {coinType}",
@@ -312,35 +414,131 @@ namespace MDBControllerLib
         }
 
 
+
         private void TryBuildCoinMapFromSetup(string setupResp)
         {
-            if (!setupResp.StartsWith("p,")) return;
+            Console.WriteLine("SETUP RAW: " + setupResp);
+
+            if (string.IsNullOrWhiteSpace(setupResp) || !setupResp.StartsWith("p,"))
+            {
+                Console.WriteLine("Setup parse aborted: response does not start with 'p,'");
+                return;
+            }
+
             var payload = setupResp.Substring(2).Trim();
             var bytes = ParseHexBytes(payload);
-            if (bytes.Count < 13) return;
+
+            Console.WriteLine("SETUP BYTES: " + string.Join(" ", bytes.Select(b => b.ToString("X2"))));
+
+            if (bytes.Count < 8)
+            {
+                Console.WriteLine($"Setup parse warning: expected at least 8 bytes, got {bytes.Count}.");
+                return;
+            }
 
             try
             {
                 int scaling = bytes[3];
+                int decimals = bytes[4];
 
-                int startIndex = 8;
+                int startIndex = 7;
                 int maxTypes = Math.Min(16, bytes.Count - startIndex);
 
                 coinTypeValues.Clear();
-                for (int i = 0; i < maxTypes; i++)
+
+                for (int rawType = 0; rawType < maxTypes; rawType++)
                 {
-                    byte creditUnits = bytes[startIndex + i];
-                    if (creditUnits == 0) continue;
+                    int idx = startIndex + rawType;
+                    if (idx >= bytes.Count)
+                        break;
+
+                    byte creditUnits = bytes[idx];
+
+                    if (creditUnits == 0x00 || creditUnits == 0xFF)
+                        continue;
 
                     int value = creditUnits * scaling;
-                    coinTypeValues[i + 1] = value; // keep 1-based numbering for display and protocol
+
+                    int coinType = rawType + 1;
+
+                    coinTypeValues[coinType] = value;
                 }
 
-                Console.WriteLine($"Coin map (scaling={scaling}): {string.Join(", ", coinTypeValues.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                Console.WriteLine(
+                    $"Coin map (scaling={scaling}, decimals={decimals}): " +
+                    string.Join(", ", coinTypeValues.Select(kv => $"{kv.Key}={kv.Value}"))
+                );
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Failed to parse setup info: {ex.Message}");
+            }
+
+            if (coinTypeValues.Count == 0)
+            {
+                Console.WriteLine("Setup parse resulted in EMPTY coin map. Using fallback map.");
+                BuildFallbackCoinMap();
+            }
+        }
+
+
+
+
+        private void BuildFallbackCoinMap()
+        {
+            coinTypeValues.Clear();
+            coinTypeValues[1] = 10;
+            coinTypeValues[2] = 20;
+            coinTypeValues[3] = 50;
+            coinTypeValues[4] = 100;
+            coinTypeValues[5] = 200;
+
+            Console.WriteLine(
+                "Fallback coin map: " +
+                string.Join(", ", coinTypeValues.Select(kv => $"{kv.Key}={kv.Value}"))
+            );
+        }
+
+
+
+        private void SyncTubesWithCoinMap()
+        {
+            if (coinTypeValues.Count == 0)
+            {
+                Console.WriteLine("Tube sync skipped: coinTypeValues is empty (no valid setup info).");
+                return;
+            }
+
+            var validTypes = new HashSet<int>(coinTypeValues.Keys);
+
+            // Remove tubes for coin types that no longer exist in setup
+            tubes.DeleteMany(t => !validTypes.Contains(t.CoinType));
+
+            // Insert or update all valid coin types
+            foreach (var kv in coinTypeValues)
+            {
+                int coinType = kv.Key;
+                int value = kv.Value;
+
+                var tube = tubes.FindOne(t => t.CoinType == coinType);
+                if (tube == null)
+                {
+                    tube = new CoinTube
+                    {
+                        CoinType = coinType,
+                        Value = value,
+                        Count = 0,
+                        Capacity = 50,
+                        Dispensable = 0
+                    };
+                    tubes.Insert(tube);
+                }
+                else
+                {
+                    // Update the denomination, keep Count/Dispensable as they are
+                    tube.Value = value;
+                    tubes.Update(tube);
+                }
             }
         }
 
@@ -367,7 +565,10 @@ namespace MDBControllerLib
         public int Id { get; set; }
         public int CoinType { get; set; }
         public int Value { get; set; }
+        // The physical coin count in the tube
         public int Count { get; set; }
+        // Number of coins allowed to be dispensed (Count - SECURITY_STOCK, >= 0)
+        public int Dispensable { get; set; }
         public int Capacity { get; set; }
         public double Fullness => (double)Count / Capacity;
     }
@@ -377,6 +578,7 @@ namespace MDBControllerLib
         public int CoinType { get; set; }
         public int Value { get; set; }
         public int Count { get; set; }
+        public int Dispensable { get; set; }
         public int Capacity { get; set; }
         public int FullnessPercent { get; set; }
         public string Status { get; set; } = "OK";
