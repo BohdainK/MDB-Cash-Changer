@@ -1,8 +1,3 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 using LiteDB;
 
 namespace MDBControllerLib
@@ -14,7 +9,7 @@ namespace MDBControllerLib
         private readonly Dictionary<int, int> coinTypeValues = new();
 
         private const string DatabasePath = "coins.db";
-        private const int SECURITY_STOCK = 3;
+        private const int SECURITY_STOCK = 0; //wegwerken !!
         private readonly LiteDatabase db;
         private readonly ILiteCollection<CoinTube> tubes;
 
