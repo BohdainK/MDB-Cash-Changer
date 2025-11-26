@@ -26,6 +26,8 @@ namespace MDBControllerLib.Domain
     {
         None,
         Accepted,
-        Dispensed
+        Dispensed,
+        Cashbox,
+        Returned
     }
 }

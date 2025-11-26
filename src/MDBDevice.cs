@@ -1,4 +1,5 @@
 using LiteDB;
+using MDBControllerLib.Domain;
 
 namespace MDBControllerLib
 {
@@ -13,12 +14,7 @@ namespace MDBControllerLib
         private readonly LiteDatabase db;
         private readonly ILiteCollection<CoinTube> tubes;
 
-        public IReadOnlyDictionary<int, int> CoinTypeValues => coinTypeValues;
-
-        private enum CoinEventType { None, Accepted, Dispensed }
-
         public string? LastEvent => lastEventPayload;
-
         private string? lastEventPayload;
 
         private bool coinInputEnabled = true;
@@ -116,27 +112,71 @@ namespace MDBControllerLib
                         Console.WriteLine($"Coin event: {parsed}");
 
                         var tube = tubes.FindOne(t => t.CoinType == coinType.Value);
-                        if (tube != null)
+
+                        switch (eventType)
                         {
-                            switch (eventType)
-                            {
-                                case CoinEventType.Accepted:
-                                    tube.Count = Math.Min(tube.Count + 1, tube.Capacity);
-                                    tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
-                                    NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
-                                        new { eventType = "coin", coinType, newCount = tube.Count, dispensable = tube.Dispensable }));
-                                    break;
+                            case CoinEventType.Accepted when tube != null:
+                                tube.Count = Math.Min(tube.Count + 1, tube.Capacity);
+                                tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
+                                tubes.Update(tube);
 
-                                case CoinEventType.Dispensed:
-                                    tube.Count = Math.Max(0, tube.Count - 1);
-                                    tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
-                                    NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
-                                        new { eventType = "dispense", coinType, newCount = tube.Count, dispensable = tube.Dispensable }));
-                                    break;
-                            }
+                                coinTypeValues.TryGetValue(coinType.Value, out var val);
 
-                            tubes.Update(tube);
+                                NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
+                                    new
+                                    {
+                                        eventType = "coin",
+                                        coinType,
+                                        value = val,
+                                        newCount = tube.Count,
+                                        dispensable = tube.Dispensable
+                                    }));
+                                break;
+
+                            case CoinEventType.Dispensed when tube != null:
+                                tube.Count = Math.Max(0, tube.Count - 1);
+                                tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
+                                tubes.Update(tube);
+
+                                coinTypeValues.TryGetValue(coinType.Value, out var dval);
+
+                                NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
+                                    new
+                                    {
+                                        eventType = "dispense",
+                                        coinType,
+                                        value = dval,
+                                        newCount = tube.Count,
+                                        dispensable = tube.Dispensable
+                                    }));
+                                break;
+
+                            case CoinEventType.Cashbox:
+                                coinTypeValues.TryGetValue(coinType.Value, out var cval);
+
+                                NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
+                                    new
+                                    {
+                                        eventType = "cashbox",
+                                        coinType,
+                                        value = cval
+                                    }));
+                                break;
+
+                            case CoinEventType.Returned:
+                                // TODO: UI event
+                                coinTypeValues.TryGetValue(coinType.Value, out var rval);
+
+                                NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
+                                    new
+                                    {
+                                        eventType = "returned",
+                                        coinType,
+                                        value = rval
+                                    }));
+                                break;
                         }
+
                     }
 
 
@@ -178,7 +218,6 @@ namespace MDBControllerLib
 
 
         #endregion
-
 
         #region Tube management
 
@@ -318,7 +357,6 @@ namespace MDBControllerLib
         #endregion
 
         #region Parsing helpers
-
         private (CoinEventType type, string? message, int? coinType) ParseCoinEvent(string resp)
         {
             if (string.IsNullOrEmpty(resp) || !resp.StartsWith("p,"))
@@ -330,26 +368,38 @@ namespace MDBControllerLib
                 return (CoinEventType.None, null, null);
 
             byte b = bytes[0];
+
             int rawType = b & 0x0F;
             int coinType = rawType + 1;
+
             if (!coinTypeValues.ContainsKey(coinType))
                 return (CoinEventType.None, null, null);
 
             byte upper = (byte)(b & 0xF0);
-            CoinEventType evtType =
-                upper == 0x50 ? CoinEventType.Accepted :
-                upper == 0x90 ? CoinEventType.Dispensed :
-                CoinEventType.None;
+
+            // TODO: adjust these nibble values to match your device’s mapping
+            CoinEventType evtType = upper switch
+            {
+                0x50 => CoinEventType.Accepted,
+                0x90 => CoinEventType.Dispensed,
+                0x40 => CoinEventType.Cashbox,
+                0x70 => CoinEventType.Returned,
+                _ => CoinEventType.None
+            };
 
             string? msg = evtType switch
             {
                 CoinEventType.Accepted => $"Accepted coin {coinType} ({coinTypeValues[coinType]})",
                 CoinEventType.Dispensed => $"Dispensed coin {coinType}",
+                CoinEventType.Cashbox => $"Cashbox coin {coinType} ({coinTypeValues[coinType]})",
+                CoinEventType.Returned => $"Returned coin {coinType}",
                 _ => null
             };
 
+
             return (evtType, msg, coinType);
         }
+
 
 
 
@@ -422,38 +472,7 @@ namespace MDBControllerLib
         }
 
         private void ThreadShortDelay() => Thread.Sleep(50);
-
-        #endregion
+        #endregion Parsing helpers
     }
-
-    #region DTO classes
-    internal class CoinTube
-    {
-        public int Id { get; set; }
-        public int CoinType { get; set; }
-        public int Value { get; set; }
-        public int Count { get; set; }
-        public int Dispensable { get; set; }
-        public int Capacity { get; set; }
-        public double Fullness => (double)Count / Capacity;
-    }
-
-    internal class CoinTubeSummary
-    {
-        public int CoinType { get; set; }
-        public int Value { get; set; }
-        public int Count { get; set; }
-        public int Dispensable { get; set; }
-        public int Capacity { get; set; }
-        public int FullnessPercent { get; set; }
-        public string Status { get; set; } = "OK";
-
-        public override string ToString()
-        {
-            return $"Type {CoinType}: {Value} units | {Count}/{Capacity} ({FullnessPercent}%) - {Status}";
-        }
-    }
-
-    #endregion
 }
 
