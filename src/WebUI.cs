@@ -14,9 +14,6 @@ namespace MDBControllerLib
         private readonly CancellationTokenSource cts = new();
 
         private readonly Dictionary<int, int> coinMap = new();
-        private int requestedAmountCents = 0;
-        private int insertedAmountCents = 0;
-        private bool requestActive = false;
 
         public WebUI(MDBDevice device, int port = 8080)
         {
@@ -30,6 +27,7 @@ namespace MDBControllerLib
             }
 
             refundManager = new CoinRefundingManager(device, coinMap);
+            refundManager.OnAmountStateChanged += HandleAmountStateChanged;
 
             device.OnStateChanged += HandleDeviceEvent;
         }
@@ -290,17 +288,20 @@ function toggleCoinInput(enabled) {
                             if (amount <= 0)
                                 return;
 
-                            requestedAmountCents = amount;
-                            insertedAmountCents = 0;
-                            requestActive = true;
-                            Console.WriteLine($"Amount request started: {requestedAmountCents} cents");
-                            BroadcastAmountState("active");
+                            try
+                            {
+                                refundManager.RequestAmount(amount);
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Failed to start request: {ex.Message}");
+                            }
                             break;
                         }
 
                     case "cancel_request":
                         {
-                            CancelCurrentRequest();
+                            refundManager.CancelRequest();
                             break;
                         }
                 }
@@ -324,141 +325,31 @@ function toggleCoinInput(enabled) {
             var payload = JsonSerializer.Serialize(new
             {
                 type = "amount_state",
-                status = requestActive ? "active" : "idle",
-                requested = requestedAmountCents,
-                inserted = insertedAmountCents,
-                remaining = Math.Max(0, requestedAmountCents - insertedAmountCents)
+                status = refundManager.IsRequestActive ? "active" : "idle",
+                requested = refundManager.RequestedAmount,
+                inserted = refundManager.InsertedAmount,
+                remaining = refundManager.RemainingAmount
             });
             var bytes = Encoding.UTF8.GetBytes(payload);
             await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
         }
 
-        private void BroadcastAmountState(string status)
+        private void HandleAmountStateChanged(AmountRequestState state)
         {
             var msg = JsonSerializer.Serialize(new
             {
                 type = "amount_state",
-                status,
-                requested = requestedAmountCents,
-                inserted = insertedAmountCents,
-                remaining = Math.Max(0, requestedAmountCents - insertedAmountCents)
+                status = state.Status,
+                requested = state.RequestedAmount,
+                inserted = state.InsertedAmount,
+                remaining = state.RemainingAmount
             });
             BroadcastAsync(msg);
-        }
-
-        private void CancelCurrentRequest()
-        {
-            if (!requestActive)
-            {
-                requestedAmountCents = 0;
-                insertedAmountCents = 0;
-                BroadcastAmountState("idle");
-                return;
-            }
-
-            Console.WriteLine($"Cancelling request. Refunding {insertedAmountCents} cents.");
-            if (insertedAmountCents > 0)
-            {
-                try
-                {
-                    refundManager.RefundAmount(insertedAmountCents);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Refund error on cancel: {ex.Message}");
-                }
-            }
-
-            requestedAmountCents = 0;
-            insertedAmountCents = 0;
-            requestActive = false;
-            BroadcastAmountState("cancelled");
         }
 
         private void HandleDeviceEvent(string message)
         {
             BroadcastAsync(message);
-
-            if (!requestActive)
-                return;
-
-            try
-            {
-                using var doc = JsonDocument.Parse(message);
-                var root = doc.RootElement;
-
-                if (!root.TryGetProperty("eventType", out var evtProp))
-                    return;
-
-                var evtType = evtProp.GetString();
-                if (string.IsNullOrEmpty(evtType))
-                    return;
-
-                if (!root.TryGetProperty("coinType", out var ctProp))
-                    return;
-
-                int coinType = ctProp.GetInt32();
-                if (!coinMap.TryGetValue(coinType, out var value) || value <= 0)
-                    return;
-
-                switch (evtType)
-                {
-                    case "coin":
-                    case "cashbox":
-                        insertedAmountCents += value;
-                        Console.WriteLine($"Inserted +{value} ct ({evtType}), total {insertedAmountCents} / {requestedAmountCents}");
-                        break;
-
-                    case "dispense":
-                        insertedAmountCents = Math.Max(0, insertedAmountCents - value);
-                        Console.WriteLine($"Dispensed {value} ct, total {insertedAmountCents} / {requestedAmountCents}");
-                        break;
-
-                    default:
-                        return;
-                }
-
-                EvaluateAmountState();
-            }
-            catch
-            {
-                // ignore parsing errors
-            }
-        }
-
-
-        private void EvaluateAmountState()
-        {
-            if (!requestActive || requestedAmountCents <= 0)
-            {
-                BroadcastAmountState("idle");
-                return;
-            }
-
-            if (insertedAmountCents < requestedAmountCents)
-            {
-                BroadcastAmountState("active");
-                return;
-            }
-
-            int overpay = insertedAmountCents - requestedAmountCents;
-            if (overpay > 0)
-            {
-                Console.WriteLine($"Overpay: {overpay} cents.");
-                try
-                {
-                    refundManager.RefundAmount(overpay);
-                    insertedAmountCents -= overpay;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Refund error on overpay: {ex.Message}");
-                }
-            }
-
-            requestActive = false;
-            Console.WriteLine($"Amount request completed. inserted: {insertedAmountCents} ct.");
-            BroadcastAmountState("success");
         }
 
         private async void BroadcastAsync(string message)
@@ -477,7 +368,7 @@ function toggleCoinInput(enabled) {
                     }
                     catch
                     {
-                        // ignore send errors
+                        // ignore
                     }
                 }
             }
