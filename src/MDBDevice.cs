@@ -11,8 +11,6 @@ namespace MDBControllerLib
 
         public string? LastEvent => lastEventPayload;
         private string? lastEventPayload;
-
-        // private bool coinInputEnabled = true;
         private int pollFailures;
 
         public MDBDevice(SerialManager serial, CancellationToken cancellationToken)
@@ -212,18 +210,6 @@ namespace MDBControllerLib
         #endregion
 
         #region Tube management
-
-        // public bool CoinInputEnabled
-        // {
-        //     get => coinInputEnabled;
-        //     set
-        //     {
-        //         if (coinInputEnabled == value) return;
-        //         coinInputEnabled = value;
-        //         ApplyCoinInhibitState();
-        //     }
-        // }
-
         public void ApplyCoinInhibitState(bool enabled)
         {
             try
@@ -297,9 +283,6 @@ namespace MDBControllerLib
 
                 var payload = resp.Substring(2).Trim();
                 var bytes = ParseHexBytes(payload);
-
-                // Console.WriteLine("TUBE STATUS RAW: " + resp);
-                // Console.WriteLine("TUBE STATUS BYTES: " + string.Join(" ", bytes.Select(b => b.ToString("X2"))));
 
                 if (bytes.Count < 3)
                 {
