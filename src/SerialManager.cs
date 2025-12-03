@@ -28,7 +28,6 @@ namespace MDBControllerLib
             serialPort.Open();
             Thread.Sleep(100);
         }
-
         public void Close()
         {
             try

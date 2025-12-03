@@ -10,7 +10,6 @@ namespace MDBControllerLib
         private readonly Dictionary<int, int> coinTypeValues = new();
 
         private const string DatabasePath = "coins.db";
-        private const int SECURITY_STOCK = 0; //wegwerken !!
         private readonly LiteDatabase db;
         private readonly ILiteCollection<CoinTube> tubes;
 
@@ -18,7 +17,7 @@ namespace MDBControllerLib
         private string? lastEventPayload;
 
         private bool coinInputEnabled = true;
-
+        private int pollFailures;
 
         public MDBDevice(SerialManager serial, CancellationToken cancellationToken)
         {
@@ -31,7 +30,7 @@ namespace MDBControllerLib
 
             foreach (var tube in tubes.FindAll())
             {
-                int expect = Math.Max(0, tube.Count - SECURITY_STOCK);
+                int expect = Math.Max(0, tube.Count);
                 if (tube.Dispensable != expect)
                 {
                     tube.Dispensable = expect;
@@ -91,7 +90,7 @@ namespace MDBControllerLib
         private async Task PollLoop()
 
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested && pollFailures <= 10)
             {
                 try
                 {
@@ -117,7 +116,7 @@ namespace MDBControllerLib
                         {
                             case CoinEventType.Accepted when tube != null:
                                 tube.Count = Math.Min(tube.Count + 1, tube.Capacity);
-                                tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
+                                tube.Dispensable = Math.Max(0, tube.Count);
                                 tubes.Update(tube);
 
                                 coinTypeValues.TryGetValue(coinType.Value, out var val);
@@ -135,7 +134,7 @@ namespace MDBControllerLib
 
                             case CoinEventType.Dispensed when tube != null:
                                 tube.Count = Math.Max(0, tube.Count - 1);
-                                tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
+                                tube.Dispensable = Math.Max(0, tube.Count);
                                 tubes.Update(tube);
 
                                 coinTypeValues.TryGetValue(coinType.Value, out var dval);
@@ -164,7 +163,6 @@ namespace MDBControllerLib
                                 break;
 
                             case CoinEventType.Returned:
-                                // TODO: UI event
                                 coinTypeValues.TryGetValue(coinType.Value, out var rval);
 
                                 NotifyStateChanged(System.Text.Json.JsonSerializer.Serialize(
@@ -185,11 +183,17 @@ namespace MDBControllerLib
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Poll loop error: {ex.Message}"); //geen exception gooien, loopen
+                    pollFailures++;
+                    Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff}] Poll loop error: {ex.Message}");
                     await Task.Delay(500, cancellationToken);
                 }
             }
+            if (pollFailures > 10)
+            {
+                throw new MDBDeviceException("No response from device. check device and restart");
+            }
         }
+
         #endregion
 
         #region Coin dispensing
@@ -286,7 +290,7 @@ namespace MDBControllerLib
             foreach (var tube in tubes.FindAll())
             {
                 tube.Count = 0;
-                tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
+                tube.Dispensable = Math.Max(0, tube.Count);
                 tubes.Update(tube);
             }
             Console.WriteLine("Tube count DB reset");
@@ -340,7 +344,7 @@ namespace MDBControllerLib
                     }
 
                     tube.Count = approxCount;
-                    tube.Dispensable = Math.Max(0, tube.Count - SECURITY_STOCK);
+                    tube.Dispensable = Math.Max(0, tube.Count);
                     tubes.Upsert(tube);
                 }
 
@@ -377,7 +381,6 @@ namespace MDBControllerLib
 
             byte upper = (byte)(b & 0xF0);
 
-            // TODO: adjust these nibble values to match your device’s mapping
             CoinEventType evtType = upper switch
             {
                 0x50 => CoinEventType.Accepted,
