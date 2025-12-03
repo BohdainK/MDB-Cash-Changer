@@ -30,10 +30,18 @@ namespace MDBControllerLib
                 if (parts.Length == 1)
                 {
                     Console.WriteLine("Expected coin_type or 'q'.");
-                } if (parts.Length >= 2) {
+                }
+                if (parts.Length >= 2)
+                {
                     if (int.TryParse(parts[0], out int coinType) && int.TryParse(parts[1], out int qty))
+                    {
+                        device.ApplyCoinInhibitState(true);
                         device.DispenseCoin(coinType, qty);
-                } else {
+                        device.ApplyCoinInhibitState(false);
+                    }
+                }
+                else
+                {
                     Console.WriteLine("Please enter two integers: <coin_type> <quantity>");
                 }
             }

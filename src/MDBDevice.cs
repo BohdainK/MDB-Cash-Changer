@@ -191,7 +191,7 @@ namespace MDBControllerLib
                 throw new ArgumentOutOfRangeException(nameof(quantity), "Quantity must be >= 1");
 
             if (quantity > tube.Dispensable)
-                throw new CoinOperationException($"Not enough dispensable coins for type {coinType}. Requested={quantity}, dispensable={tube.Dispensable}, count={tube.Count}");
+                Console.WriteLine($"Not enough dispensable coins for type {coinType}. Requested={quantity}, dispensable={tube.Dispensable}, count={tube.Count}");
 
             int rawType = coinType - 1;
             if (rawType < 0 || rawType > 15)
@@ -271,56 +271,72 @@ namespace MDBControllerLib
 
         private void RefreshTubeLevelsFromHardware()
         {
-            try
+            const int MAX_RETRIES = 3;
+            const int RETRY_DELAY_MS = 100;
+
+            Exception? lastException = null;
+
+            for (int attempt = 1; attempt <= MAX_RETRIES; attempt++)
             {
-                serial.WriteLine(CommandConstants.TUBE_STATUS_REQUEST);
-                var resp = serial.ReadLine(500);
-
-                if (string.IsNullOrWhiteSpace(resp) || !resp.StartsWith("p,"))
+                try
                 {
-                    throw new TubeRefreshException("Tube status: no valid response.");
-                }
+                    serial.WriteLine(CommandConstants.TUBE_STATUS_REQUEST);
+                    var resp = serial.ReadLine(500);
 
-                var payload = resp.Substring(2).Trim();
-                var bytes = ParseHexBytes(payload);
-
-                if (bytes.Count < 3)
-                {
-                    throw new TubeRefreshException("Tube status: too few bytes.");
-                }
-
-                const int FLAGS_BYTES = 2;
-                const int MAX_TYPES = 16;
-
-                for (int rawType = 0; rawType < MAX_TYPES; rawType++)
-                {
-                    int idx = FLAGS_BYTES + rawType;
-                    if (idx >= bytes.Count)
-                        break;
-
-                    int approxCount = bytes[idx];
-                    int coinType = rawType + 1;
-
-                    if (!tubes.TryGetValue(coinType, out var tube))
+                    if (string.IsNullOrWhiteSpace(resp) || !resp.StartsWith("p,"))
                     {
-                        int value = coinTypeValues.TryGetValue(coinType, out var v) ? v : 0;
-                        tube = new CoinTube
-                        {
-                            CoinType = coinType,
-                            Value = value,
-                            Capacity = 50
-                        };
-                        tubes[coinType] = tube;
+                        throw new TubeRefreshException("Tube status: no valid response.");
                     }
 
-                    tube.Count = approxCount;
-                    tube.Dispensable = Math.Max(0, tube.Count);
+                    var payload = resp.Substring(2).Trim();
+                    var bytes = ParseHexBytes(payload);
+
+                    if (bytes.Count < 3)
+                    {
+                        throw new TubeRefreshException("Tube status: too few bytes.");
+                    }
+
+                    const int FLAGS_BYTES = 2;
+                    const int MAX_TYPES = 16;
+
+                    for (int rawType = 0; rawType < MAX_TYPES; rawType++)
+                    {
+                        int idx = FLAGS_BYTES + rawType;
+                        if (idx >= bytes.Count)
+                            break;
+
+                        int approxCount = bytes[idx];
+                        int coinType = rawType + 1;
+
+                        if (!tubes.TryGetValue(coinType, out var tube))
+                        {
+                            int value = coinTypeValues.TryGetValue(coinType, out var v) ? v : 0;
+                            tube = new CoinTube
+                            {
+                                CoinType = coinType,
+                                Value = value,
+                                Capacity = 50
+                            };
+                            tubes[coinType] = tube;
+                        }
+
+                        tube.Count = approxCount;
+                        tube.Dispensable = Math.Max(0, tube.Count);
+                    }
+                    Console.WriteLine("Tube levels refreshed from hardware.");
+                    return; // Success!
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    if (attempt < MAX_RETRIES)
+                    {
+                        Thread.Sleep(RETRY_DELAY_MS);
+                    }
                 }
             }
-            catch (Exception ex)
-            {
-                throw new TubeRefreshException("Error refreshing tube levels from hardware.", ex);
-            }
+
+            throw new TubeRefreshException($"Error refreshing tube levels from hardware after {MAX_RETRIES} attempts.", lastException!);
         }
 
 
