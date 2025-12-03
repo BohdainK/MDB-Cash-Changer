@@ -78,11 +78,6 @@ input[type='number'] { padding:6px; border:1px solid #ccc; border-radius:4px; }
     <button onclick='resetTubes()' style='background:#b22222'>Reset All Tubes</button>
 </div>
 
-<label>
-    <input type='checkbox' id='acceptToggle' checked onchange='toggleCoinInput(this.checked)'>
-    Accept Coins
-</label>
-
 <!-- NEW: Amount request panel -->
 <div id='amountPanel'>
     <h3>Amount Request</h3>
@@ -156,7 +151,6 @@ function updateSingle(e) {
     }
 }
 
-// NEW: update amount state panel
 function updateAmountState(s) {
     const req = document.getElementById('reqAmount');
     const ins = document.getElementById('insAmount');
@@ -186,7 +180,6 @@ function dispense(type) {
     ws.send(JSON.stringify({ action:'dispense', coinType:type }));
 }
 
-// NEW: start / cancel amount request
 function startAmountRequest() {
     const input = document.getElementById('amountInput');
     const val = parseInt(input.value, 10);
@@ -207,9 +200,6 @@ function resetTubes() {
     }
 }
 
-function toggleCoinInput(enabled) {
-    ws.send(JSON.stringify({ action:'toggle_accept', enabled }));
-}
 </script>
 </body>
 </html>";
@@ -273,12 +263,6 @@ function toggleCoinInput(enabled) {
                         {
                             device.ResetAllTubes();
                             BroadcastAsync(JsonSerializer.Serialize(new { type = "reset" }));
-                            break;
-                        }
-                    case "toggle_accept":
-                        {
-                            bool enabled = json.RootElement.GetProperty("enabled").GetBoolean();
-                            device.CoinInputEnabled = enabled;
                             break;
                         }
 

@@ -69,6 +69,7 @@ namespace MDBControllerLib
             if (requestActive)
                 throw new InvalidOperationException("A request is already active. Cancel it first.");
 
+            device.ApplyCoinInhibitState(true);
             requestedAmountCents = amountCents;
             insertedAmountCents = 0;
             requestActive = true;
@@ -127,7 +128,7 @@ namespace MDBControllerLib
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Refund error on cancel: {ex.Message}");
+                    throw new CoinOperationException($"Refund error on cancel: {ex.Message}");
                 }
             }
 
@@ -163,12 +164,13 @@ namespace MDBControllerLib
                     }
                     else
                     {
-                        Console.WriteLine("Warning: Could not refund exact overpay amount.");
+                        throw new CoinOperationException("Warning: Could not refund exact overpay amount.");
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Refund error on overpay: {ex.Message}");
+                    device.ApplyCoinInhibitState(false);
+                    throw new CoinOperationException($"Refund error on overpay: {ex.Message}");
                 }
             }
 
@@ -196,7 +198,7 @@ namespace MDBControllerLib
             var tubesSnapshot = device.CoinTubes
                 .Select(t => new { t.CoinType, t.Value, t.Count, t.Dispensable })
                 .Where(t => t.Dispensable > 0 && t.Value > 0)
-                .OrderByDescending(t => t.Value) // use highest value coins first
+                .OrderByDescending(t => t.Value)
                 .ToList();
 
             if (!tubesSnapshot.Any())
@@ -234,7 +236,7 @@ namespace MDBControllerLib
                     device.DispenseCoin(coinType, qty);
                 }
             }
-
+            device.ApplyCoinInhibitState(false);
             return true;
         }
     }
